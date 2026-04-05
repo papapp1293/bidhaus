@@ -9,9 +9,19 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { InviteLinks } from "@/components/InviteLinks";
 import { ParticipantList } from "@/components/ParticipantList";
 import { ItemManager } from "@/components/ItemManager";
+import { useSocket } from "@/hooks/useSocket";
+
+type Participant = {
+  id: string;
+  name: string;
+  role: "BIDDER" | "SPECTATOR";
+  budget: number | null;
+  connected: boolean;
+};
 
 type SessionData = {
   id: string;
@@ -21,14 +31,7 @@ type SessionData = {
   budgetPerBidder: number;
   timePerItem: number;
   hostName: string;
-  participants: {
-    id: string;
-    name: string;
-    role: "BIDDER" | "SPECTATOR";
-    budget: number | null;
-    connected: boolean;
-    joinedAt: string;
-  }[];
+  participants: Participant[];
   items: {
     id: string;
     name: string;
@@ -43,9 +46,14 @@ export default function LobbyPage() {
   const code = params.code;
 
   const [session, setSession] = useState<SessionData | null>(null);
+  const [participants, setParticipants] = useState<Participant[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
   const [hostToken, setHostToken] = useState<string | null>(null);
+
+  // Get token for socket connection
+  const [socketToken, setSocketToken] = useState<string | null>(null);
+  const { connected, on } = useSocket(code, socketToken);
 
   const fetchSession = useCallback(async () => {
     try {
@@ -56,6 +64,7 @@ export default function LobbyPage() {
       }
       const data = await res.json();
       setSession(data);
+      setParticipants(data.participants);
     } catch {
       setError("Failed to load session");
     }
@@ -63,17 +72,38 @@ export default function LobbyPage() {
 
   useEffect(() => {
     fetchSession();
-    // Poll for updates until we have WebSocket (Step 4)
-    const interval = setInterval(fetchSession, 3000);
 
-    const token = sessionStorage.getItem(`host:${code}`);
-    if (token) {
+    const hToken = sessionStorage.getItem(`host:${code}`);
+    if (hToken) {
       setIsHost(true);
-      setHostToken(token);
+      setHostToken(hToken);
     }
 
-    return () => clearInterval(interval);
+    // Use participant token for socket if available, otherwise fall back to polling
+    const pToken = sessionStorage.getItem(`participant:${code}`);
+    if (pToken) {
+      setSocketToken(pToken);
+    }
   }, [code, fetchSession]);
+
+  // Listen for real-time presence updates
+  useEffect(() => {
+    if (!connected) return;
+
+    const unsub = on("presence:update", (data) => {
+      setParticipants(data.participants as Participant[]);
+    });
+
+    return unsub;
+  }, [connected, on]);
+
+  // Fall back to polling if not connected via WebSocket
+  useEffect(() => {
+    if (connected) return;
+
+    const interval = setInterval(fetchSession, 3000);
+    return () => clearInterval(interval);
+  }, [connected, fetchSession]);
 
   if (error) {
     return (
@@ -96,15 +126,23 @@ export default function LobbyPage() {
       <div className="flex w-full max-w-2xl flex-col gap-6">
         <Card>
           <CardHeader>
-            <CardTitle>{session.name}</CardTitle>
-            <CardDescription>
-              Hosted by {session.hostName} &middot; ${session.budgetPerBidder}{" "}
-              budget &middot; {session.timePerItem}s per item
-            </CardDescription>
+            <div className="flex items-center justify-between">
+              <div>
+                <CardTitle>{session.name}</CardTitle>
+                <CardDescription>
+                  Hosted by {session.hostName} &middot; $
+                  {session.budgetPerBidder} budget &middot;{" "}
+                  {session.timePerItem}s per item
+                </CardDescription>
+              </div>
+              <Badge variant={connected ? "default" : "secondary"}>
+                {connected ? "Live" : "Polling"}
+              </Badge>
+            </div>
           </CardHeader>
           <CardContent className="flex flex-col gap-6">
             {isHost && <InviteLinks code={code} />}
-            <ParticipantList participants={session.participants} />
+            <ParticipantList participants={participants} />
           </CardContent>
         </Card>
 
