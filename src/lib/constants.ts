@@ -1,0 +1,10 @@
+export const DEFAULT_BUDGET = 100;
+export const DEFAULT_TIME_PER_ITEM = 30; // seconds
+export const MIN_BID_INCREMENT = 1;
+export const MAX_ITEMS_PER_SESSION = 100;
+export const MAX_BIDDERS_PER_SESSION = 20;
+export const SESSION_EXPIRY_HOURS = 24;
+export const RATE_LIMIT_BIDS_PER_SECOND = 3;
+export const TIMER_SYNC_INTERVAL_MS = 5000;
+export const HOST_DISCONNECT_GRACE_MS = 60_000;
+export const INVITE_CODE_LENGTH = 8;
