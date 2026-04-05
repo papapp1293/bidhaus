@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import {
   Card,
   CardContent,
@@ -10,6 +10,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { InviteLinks } from "@/components/InviteLinks";
 import { ParticipantList } from "@/components/ParticipantList";
 import { ItemManager } from "@/components/ItemManager";
@@ -43,6 +44,7 @@ type SessionData = {
 
 export default function LobbyPage() {
   const params = useParams<{ code: string }>();
+  const router = useRouter();
   const code = params.code;
 
   const [session, setSession] = useState<SessionData | null>(null);
@@ -180,9 +182,30 @@ export default function LobbyPage() {
           </Card>
         )}
 
+        {isHost && hostToken && session.items.length > 0 && (
+          <Button
+            size="lg"
+            className="w-full"
+            onClick={async () => {
+              const res = await fetch(`/api/sessions/${code}/control`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ token: hostToken, action: "start" }),
+              });
+              if (res.ok) {
+                router.push(`/session/${code}/live`);
+              }
+            }}
+          >
+            Start Auction
+          </Button>
+        )}
+
         <p className="text-center text-sm text-muted-foreground">
           {session.items.length} item{session.items.length !== 1 && "s"} ready
-          &middot; Waiting for host to start auction
+          {isHost && session.items.length > 0
+            ? ""
+            : " \u00B7 Waiting for host to start auction"}
         </p>
       </div>
     </div>

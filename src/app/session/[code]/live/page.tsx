@@ -1,0 +1,336 @@
+"use client";
+
+import { useState, useEffect, useCallback } from "react";
+import { useParams, useRouter } from "next/navigation";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { CountdownTimer } from "@/components/CountdownTimer";
+import { BidPanel } from "@/components/BidPanel";
+import { BidFeed } from "@/components/BidFeed";
+import { RosterView } from "@/components/RosterView";
+import { useSocket } from "@/hooks/useSocket";
+
+type CurrentItem = {
+  id: string;
+  name: string;
+  description?: string | null;
+  minBid: number;
+  order: number;
+};
+
+type BidEntry = {
+  participantName: string;
+  amount: number;
+  itemId: string;
+  timestamp: string;
+};
+
+type Participant = {
+  id: string;
+  name: string;
+  role: string;
+  budget: number | null;
+  connected: boolean;
+};
+
+export default function LivePage() {
+  const params = useParams<{ code: string }>();
+  const router = useRouter();
+  const code = params.code;
+
+  const [isHost, setIsHost] = useState(false);
+  const [hostToken, setHostToken] = useState<string | null>(null);
+  const [participantToken, setParticipantToken] = useState<string | null>(null);
+  const [role, setRole] = useState<string | null>(null);
+  const [myBudget, setMyBudget] = useState<number>(0);
+
+  const [currentItem, setCurrentItem] = useState<CurrentItem | null>(null);
+  const [currentBid, setCurrentBid] = useState<number | null>(null);
+  const [endsAt, setEndsAt] = useState<string | null>(null);
+  const [serverRemainingMs, setServerRemainingMs] = useState<number | undefined>();
+  const [bids, setBids] = useState<BidEntry[]>([]);
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [sessionStatus, setSessionStatus] = useState<string>("LIVE");
+  const [lastEvent, setLastEvent] = useState<string>("");
+
+  const socketToken = participantToken ?? hostToken;
+  const { connected, emit, on } = useSocket(code, socketToken);
+
+  // Initialize tokens
+  useEffect(() => {
+    const hToken = sessionStorage.getItem(`host:${code}`);
+    const pToken = sessionStorage.getItem(`participant:${code}`);
+
+    if (hToken) {
+      setIsHost(true);
+      setHostToken(hToken);
+    }
+    if (pToken) {
+      setParticipantToken(pToken);
+    }
+
+    // Fetch initial session state
+    fetch(`/api/sessions/${code}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.status === "LOBBY") {
+          router.push(`/session/${code}/lobby`);
+          return;
+        }
+        if (data.status === "COMPLETED") {
+          router.push(`/session/${code}/results`);
+          return;
+        }
+        setSessionStatus(data.status);
+        setParticipants(data.participants);
+
+        // Find current active item
+        if (data.currentItemIdx !== null && data.items[data.currentItemIdx]) {
+          const item = data.items[data.currentItemIdx];
+          setCurrentItem(item);
+          setCurrentBid(item.currentBid);
+        }
+
+        // Set role and budget
+        if (pToken) {
+          const me = data.participants.find(
+            () => true // We'll match by token on the server
+          );
+          // Fetch own info
+          fetch(`/api/sessions/${code}`)
+            .then((r) => r.json())
+            .then((d) => {
+              const participant = d.participants.find(
+                (p: Participant) => p.connected
+              );
+              if (participant) {
+                setRole(participant.role);
+                setMyBudget(participant.budget ?? 0);
+              }
+            });
+        }
+      });
+  }, [code, router]);
+
+  // Socket event listeners
+  useEffect(() => {
+    if (!connected) return;
+
+    const unsubs = [
+      on("item:start", (data) => {
+        setCurrentItem(data.item);
+        setEndsAt(data.endsAt);
+        setCurrentBid(null);
+        setBids([]);
+        setLastEvent("");
+      }),
+      on("bid:new", (data) => {
+        setBids((prev) => [...prev, data]);
+        setCurrentBid(data.amount);
+      }),
+      on("bid:rejected", (data) => {
+        setLastEvent(`Bid rejected: ${data.reason}`);
+      }),
+      on("timer:sync", (data) => {
+        setServerRemainingMs(data.remainingMs);
+      }),
+      on("item:sold", (data) => {
+        setLastEvent(`Sold to ${data.winner} for $${data.amount}!`);
+        setCurrentItem(null);
+      }),
+      on("item:unsold", () => {
+        setLastEvent("Item went unsold");
+        setCurrentItem(null);
+      }),
+      on("session:paused", () => {
+        setSessionStatus("PAUSED");
+      }),
+      on("session:resumed", () => {
+        setSessionStatus("LIVE");
+      }),
+      on("session:completed", () => {
+        setSessionStatus("COMPLETED");
+        router.push(`/session/${code}/results`);
+      }),
+      on("presence:update", (data) => {
+        setParticipants(data.participants as Participant[]);
+        // Update own budget
+        if (participantToken) {
+          // Find self by looking at connected bidders
+          const bidders = data.participants.filter(
+            (p) => p.role === "BIDDER"
+          );
+          // We'll track budget from presence updates
+          const me = bidders.find((p) => p.connected);
+          if (me && me.budget !== null) {
+            setMyBudget(me.budget);
+          }
+        }
+      }),
+    ];
+
+    return () => unsubs.forEach((u) => u());
+  }, [connected, on, code, router, participantToken]);
+
+  const handleBid = useCallback(
+    (amount: number) => {
+      if (!currentItem || !participantToken) return;
+      emit("bid:place", {
+        itemId: currentItem.id,
+        amount,
+        token: participantToken,
+      });
+    },
+    [currentItem, participantToken, emit]
+  );
+
+  const handleHostAction = useCallback(
+    (action: "host:start" | "host:pause" | "host:resume" | "host:skip" | "host:close-item") => {
+      if (!hostToken) return;
+      emit(action, { token: hostToken });
+    },
+    [hostToken, emit]
+  );
+
+  const bidders = participants.filter((p) => p.role === "BIDDER");
+  const isBidder = role === "BIDDER";
+
+  return (
+    <div className="flex flex-1 justify-center px-4 py-6">
+      <div className="flex w-full max-w-4xl flex-col gap-4 lg:flex-row">
+        {/* Main auction area */}
+        <div className="flex flex-1 flex-col gap-4">
+          {/* Status bar */}
+          <div className="flex items-center justify-between">
+            <h1 className="text-lg font-bold">Live Auction</h1>
+            <div className="flex items-center gap-2">
+              <Badge variant={connected ? "default" : "secondary"}>
+                {connected ? "Live" : "Reconnecting..."}
+              </Badge>
+              <Badge
+                variant={
+                  sessionStatus === "PAUSED" ? "destructive" : "secondary"
+                }
+              >
+                {sessionStatus}
+              </Badge>
+            </div>
+          </div>
+
+          {/* Current item */}
+          <Card>
+            <CardHeader>
+              <CardTitle>
+                {currentItem
+                  ? `#${currentItem.order + 1}: ${currentItem.name}`
+                  : "Waiting for next item..."}
+              </CardTitle>
+              {currentItem?.description && (
+                <CardDescription>{currentItem.description}</CardDescription>
+              )}
+            </CardHeader>
+            <CardContent className="flex flex-col gap-4">
+              {currentItem && (
+                <>
+                  <CountdownTimer
+                    endsAt={endsAt}
+                    serverRemainingMs={serverRemainingMs}
+                  />
+
+                  {isBidder && sessionStatus === "LIVE" && (
+                    <BidPanel
+                      currentBid={currentBid}
+                      minBid={currentItem.minBid}
+                      budget={myBudget}
+                      onBid={handleBid}
+                      disabled={sessionStatus !== "LIVE"}
+                    />
+                  )}
+                </>
+              )}
+
+              {lastEvent && (
+                <p className="text-center text-sm font-medium">{lastEvent}</p>
+              )}
+
+              {/* Host controls */}
+              {isHost && (
+                <div className="flex gap-2 border-t pt-4">
+                  {sessionStatus === "LIVE" && (
+                    <>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleHostAction("host:pause")}
+                      >
+                        Pause
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleHostAction("host:close-item")}
+                      >
+                        Close Item
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleHostAction("host:skip")}
+                      >
+                        Skip
+                      </Button>
+                    </>
+                  )}
+                  {sessionStatus === "PAUSED" && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleHostAction("host:resume")}
+                    >
+                      Resume
+                    </Button>
+                  )}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Bid feed */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Bid History</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <BidFeed bids={bids} />
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Sidebar — rosters */}
+        <div className="w-full lg:w-72">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Rosters</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <RosterView
+                bidders={bidders.map((b) => ({
+                  name: b.name,
+                  budget: b.budget,
+                  wonItems: [],
+                }))}
+              />
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}
