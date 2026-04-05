@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/card";
 import { InviteLinks } from "@/components/InviteLinks";
 import { ParticipantList } from "@/components/ParticipantList";
+import { ItemManager } from "@/components/ItemManager";
 
 type SessionData = {
   id: string;
@@ -28,7 +29,13 @@ type SessionData = {
     connected: boolean;
     joinedAt: string;
   }[];
-  items: { id: string; name: string; order: number }[];
+  items: {
+    id: string;
+    name: string;
+    description?: string | null;
+    minBid: number;
+    order: number;
+  }[];
 };
 
 export default function LobbyPage() {
@@ -38,6 +45,7 @@ export default function LobbyPage() {
   const [session, setSession] = useState<SessionData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
+  const [hostToken, setHostToken] = useState<string | null>(null);
 
   const fetchSession = useCallback(async () => {
     try {
@@ -58,9 +66,11 @@ export default function LobbyPage() {
     // Poll for updates until we have WebSocket (Step 4)
     const interval = setInterval(fetchSession, 3000);
 
-    // Check if current user is the host
-    const hostToken = sessionStorage.getItem(`host:${code}`);
-    if (hostToken) setIsHost(true);
+    const token = sessionStorage.getItem(`host:${code}`);
+    if (token) {
+      setIsHost(true);
+      setHostToken(token);
+    }
 
     return () => clearInterval(interval);
   }, [code, fetchSession]);
@@ -94,15 +104,48 @@ export default function LobbyPage() {
           </CardHeader>
           <CardContent className="flex flex-col gap-6">
             {isHost && <InviteLinks code={code} />}
-
             <ParticipantList participants={session.participants} />
-
-            <div className="text-sm text-muted-foreground">
-              {session.items.length} item{session.items.length !== 1 && "s"}{" "}
-              ready &middot; Waiting for host to start auction
-            </div>
           </CardContent>
         </Card>
+
+        {isHost && hostToken && (
+          <ItemManager
+            sessionCode={code}
+            hostToken={hostToken}
+            items={session.items}
+            onItemsChange={fetchSession}
+          />
+        )}
+
+        {!isHost && session.items.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">
+                Items ({session.items.length})
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ul className="flex flex-col gap-1">
+                {session.items.map((item, idx) => (
+                  <li
+                    key={item.id}
+                    className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm"
+                  >
+                    <span className="text-muted-foreground w-6 text-right">
+                      {idx + 1}.
+                    </span>
+                    <span>{item.name}</span>
+                  </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        )}
+
+        <p className="text-center text-sm text-muted-foreground">
+          {session.items.length} item{session.items.length !== 1 && "s"} ready
+          &middot; Waiting for host to start auction
+        </p>
       </div>
     </div>
   );
