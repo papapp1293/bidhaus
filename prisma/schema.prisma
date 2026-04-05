@@ -1,0 +1,99 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id              String        @id @default(cuid())
+  code            String        @unique
+  name            String
+  hostName        String
+  hostToken       String        @unique
+  budgetPerBidder Int           @default(100)
+  timePerItem     Int           @default(30)
+  status          SessionStatus @default(LOBBY)
+  currentItemIdx  Int?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  items        Item[]
+  participants Participant[]
+
+  @@index([status, createdAt])
+}
+
+model Item {
+  id          String     @id @default(cuid())
+  sessionId   String
+  session     Session    @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  imageUrl    String?
+  minBid      Int        @default(1)
+  order       Int
+  status      ItemStatus @default(PENDING)
+  currentBid  Int?
+  version     Int        @default(0)
+  winnerId    String?
+  winner      Participant? @relation("wonItems", fields: [winnerId], references: [id])
+
+  bids Bid[]
+
+  @@unique([sessionId, order])
+  @@index([sessionId, status])
+}
+
+model Participant {
+  id        String          @id @default(cuid())
+  sessionId String
+  session   Session         @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  name      String
+  token     String          @unique
+  role      ParticipantRole
+  budget    Int?
+  connected Boolean         @default(false)
+  joinedAt  DateTime        @default(now())
+
+  bids     Bid[]
+  wonItems Item[] @relation("wonItems")
+
+  @@unique([sessionId, name])
+  @@index([sessionId, role])
+}
+
+model Bid {
+  id            String      @id @default(cuid())
+  amount        Int
+  createdAt     DateTime    @default(now())
+  itemId        String
+  item          Item        @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  participantId String
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+
+  @@index([itemId, createdAt])
+  @@index([participantId])
+}
+
+enum SessionStatus {
+  LOBBY
+  LIVE
+  PAUSED
+  COMPLETED
+}
+
+enum ItemStatus {
+  PENDING
+  ACTIVE
+  SOLD
+  UNSOLD
+}
+
+enum ParticipantRole {
+  BIDDER
+  SPECTATOR
+}
