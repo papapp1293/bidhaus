@@ -12,6 +12,12 @@ import {
   getRemainingMs,
   TIMER_SYNC_INTERVAL_MS,
 } from "./timer-service";
+import {
+  scheduleItemExpiryJob,
+  cancelItemExpiryJob,
+  enqueueResultsSummary,
+} from "./queue";
+import { ITEM_EXPIRY_CHANNEL } from "@/worker/jobs/item-expiry";
 
 export type ServerToClientEvents = {
   "bid:new": (data: {
@@ -215,14 +221,16 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
             endsAt: new Date(endsAt).toISOString(),
           });
 
-          // Start timer sync and expiry
+          // Start timer sync and BullMQ delayed expiry job
           scheduleTimerSync(io, session.code, session.id, endsAt);
-          scheduleItemExpiry(
-            io,
-            session.code,
-            session.id,
-            result.item.id,
-            session.timePerItem
+          await scheduleItemExpiryJob(
+            {
+              sessionId: session.id,
+              sessionCode: session.code,
+              itemId: result.item.id,
+              timePerItem: session.timePerItem,
+            },
+            session.timePerItem * 1000
           );
         }
       } catch (err) {
@@ -276,6 +284,7 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
 
         const currentItem = session.items[session.currentItemIdx ?? 0];
         if (currentItem) {
+          await cancelItemExpiryJob(currentItem.id);
           await prisma.item.update({
             where: { id: currentItem.id },
             data: { status: "UNSOLD" },
@@ -303,6 +312,7 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
         const currentItem = session.items[session.currentItemIdx ?? 0];
         if (!currentItem) return;
 
+        await cancelItemExpiryJob(currentItem.id);
         await clearTimer(session.id);
         const award = await awardItem(currentItem.id);
         const room = `session:${session.code}`;
@@ -354,6 +364,64 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
     });
   });
 
+  // --- Worker bridge: subscribe to item expiry events from BullMQ worker ---
+  const workerSub = new Redis(redisUrl, { lazyConnect: true });
+  workerSub
+    .connect()
+    .then(() => workerSub.subscribe(ITEM_EXPIRY_CHANNEL))
+    .then(() => logger.info("Subscribed to worker item-expiry channel"))
+    .catch((err) =>
+      logger.warn({ err }, "Failed to subscribe to worker channel")
+    );
+
+  workerSub.on("message", async (_channel: string, message: string) => {
+    try {
+      const data = JSON.parse(message);
+      const room = `session:${data.sessionCode}`;
+
+      // Broadcast award result
+      if (data.award.sold) {
+        io.to(room).emit("item:sold", {
+          itemId: data.award.itemId,
+          winner: data.award.winner,
+          amount: data.award.amount,
+        });
+      } else {
+        io.to(room).emit("item:unsold", { itemId: data.award.itemId });
+      }
+
+      // Broadcast next item or session completion
+      if (data.next.completed) {
+        const session = await prisma.session.findUnique({
+          where: { id: data.sessionId },
+          include: {
+            participants: {
+              where: { role: "BIDDER" },
+              include: { wonItems: true },
+            },
+          },
+        });
+        io.to(room).emit("session:completed", { results: session });
+
+        const interval = timerIntervals.get(data.sessionId);
+        if (interval) clearInterval(interval);
+        timerIntervals.delete(data.sessionId);
+      } else if (data.next.item) {
+        io.to(room).emit("item:start", {
+          item: data.next.item,
+          endsAt: data.next.endsAt,
+        });
+
+        const endsAt = new Date(data.next.endsAt).getTime();
+        scheduleTimerSync(io, data.sessionCode, data.sessionId, endsAt);
+      }
+
+      await broadcastPresence(io, data.sessionCode);
+    } catch (err) {
+      logger.error({ err }, "Error processing worker message");
+    }
+  });
+
   return io;
 }
 
@@ -382,7 +450,6 @@ function findRoomForSocket(socket: { rooms: Set<string> }): string | null {
 
 // Timer management
 const timerIntervals = new Map<string, NodeJS.Timeout>();
-const expiryTimeouts = new Map<string, NodeJS.Timeout>();
 
 function scheduleTimerSync(
   io: AppSocketServer,
@@ -403,46 +470,6 @@ function scheduleTimerSync(
   }, TIMER_SYNC_INTERVAL_MS);
 
   timerIntervals.set(sessionId, interval);
-}
-
-function scheduleItemExpiry(
-  io: AppSocketServer,
-  sessionCode: string,
-  sessionId: string,
-  itemId: string,
-  durationSeconds: number
-) {
-  const existing = expiryTimeouts.get(sessionId);
-  if (existing) clearTimeout(existing);
-
-  const timeout = setTimeout(async () => {
-    try {
-      const session = await prisma.session.findUnique({
-        where: { id: sessionId },
-      });
-      if (!session || session.status !== "LIVE") return;
-
-      const award = await awardItem(itemId);
-      const room = `session:${sessionCode}`;
-
-      if (award.sold) {
-        io.to(room).emit("item:sold", {
-          itemId,
-          winner: award.winner!,
-          amount: award.amount!,
-        });
-      } else {
-        io.to(room).emit("item:unsold", { itemId });
-      }
-
-      await broadcastPresence(io, sessionCode);
-      await startNextItem(io, sessionCode, sessionId, durationSeconds);
-    } catch (err) {
-      logger.error({ err }, "Error in item expiry");
-    }
-  }, durationSeconds * 1000);
-
-  expiryTimeouts.set(sessionId, timeout);
 }
 
 async function startNextItem(
@@ -467,11 +494,13 @@ async function startNextItem(
 
     io.to(room).emit("session:completed", { results: session });
 
-    // Cleanup timers
+    // Cleanup timer sync interval
     const interval = timerIntervals.get(sessionId);
     if (interval) clearInterval(interval);
     timerIntervals.delete(sessionId);
-    expiryTimeouts.delete(sessionId);
+
+    // Enqueue results summary generation
+    await enqueueResultsSummary(sessionId);
     return;
   }
 
@@ -482,7 +511,10 @@ async function startNextItem(
       endsAt: new Date(endsAt).toISOString(),
     });
     scheduleTimerSync(io, sessionCode, sessionId, endsAt);
-    scheduleItemExpiry(io, sessionCode, sessionId, result.item.id, timePerItem);
+    await scheduleItemExpiryJob(
+      { sessionId, sessionCode, itemId: result.item.id, timePerItem },
+      timePerItem * 1000
+    );
   }
 }
 
