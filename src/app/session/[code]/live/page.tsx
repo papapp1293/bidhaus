@@ -215,7 +215,7 @@ export default function LivePage() {
   const isBidder = role === "BIDDER";
 
   return (
-    <div className="flex flex-1 justify-center px-4 py-6">
+    <div className="flex flex-1 justify-center px-3 py-4 sm:px-4 sm:py-6">
       <div className="flex w-full max-w-4xl flex-col gap-4 lg:flex-row">
         {/* Main auction area */}
         <div className="flex flex-1 flex-col gap-4">
@@ -274,27 +274,27 @@ export default function LivePage() {
 
               {/* Host controls */}
               {isHost && (
-                <div className="flex gap-2 border-t pt-4">
+                <div className="flex flex-wrap gap-2 border-t pt-4">
                   {sessionStatus === "LIVE" && (
                     <>
                       <Button
                         variant="outline"
-                        size="sm"
                         onClick={() => handleHostAction("host:pause")}
+                        className="min-h-11 flex-1 sm:min-h-9 sm:flex-none"
                       >
                         Pause
                       </Button>
                       <Button
                         variant="outline"
-                        size="sm"
                         onClick={() => handleHostAction("host:close-item")}
+                        className="min-h-11 flex-1 sm:min-h-9 sm:flex-none"
                       >
                         Close Item
                       </Button>
                       <Button
                         variant="outline"
-                        size="sm"
                         onClick={() => handleHostAction("host:skip")}
+                        className="min-h-11 flex-1 sm:min-h-9 sm:flex-none"
                       >
                         Skip
                       </Button>
@@ -303,8 +303,8 @@ export default function LivePage() {
                   {sessionStatus === "PAUSED" && (
                     <Button
                       variant="outline"
-                      size="sm"
                       onClick={() => handleHostAction("host:resume")}
+                      className="min-h-11 flex-1 sm:min-h-9 sm:flex-none"
                     >
                       Resume
                     </Button>

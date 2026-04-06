@@ -39,15 +39,15 @@ export function BidPanel({
         </span>
       </div>
 
-      {/* Quick bid buttons */}
-      <div className="grid grid-cols-4 gap-2">
+      {/* Quick bid buttons — large touch targets on mobile */}
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         {quickBids.map((amount) => (
           <Button
             key={amount}
             variant="outline"
-            size="sm"
             disabled={disabled || amount > budget}
             onClick={() => onBid(amount)}
+            className="min-h-12 text-base sm:min-h-9 sm:text-sm"
           >
             ${amount}
           </Button>
@@ -62,11 +62,12 @@ export function BidPanel({
           max={budget}
           value={customAmount}
           onChange={(e) => setCustomAmount(Number(e.target.value))}
-          className="flex-1"
+          className="min-h-12 flex-1 text-base sm:min-h-9 sm:text-sm"
         />
         <Button
           disabled={disabled || customAmount < nextMin || customAmount > budget}
           onClick={() => onBid(customAmount)}
+          className="min-h-12 text-base sm:min-h-9 sm:text-sm"
         >
           Bid ${customAmount}
         </Button>
