@@ -37,7 +37,17 @@ export async function POST(
     );
 
     if (!result.success) {
-      return NextResponse.json({ error: result.reason }, { status: 400 });
+      const status = result.retryAfterMs ? 429 : 400;
+      const headers: Record<string, string> = {};
+      if (result.retryAfterMs) {
+        headers["Retry-After"] = String(
+          Math.ceil(result.retryAfterMs / 1000)
+        );
+      }
+      return NextResponse.json(
+        { error: result.reason },
+        { status, headers }
+      );
     }
 
     return NextResponse.json(result.bid, { status: 201 });

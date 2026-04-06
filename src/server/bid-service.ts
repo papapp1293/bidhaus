@@ -1,15 +1,26 @@
 import { prisma } from "./db";
 import { logger } from "@/lib/logger";
+import { checkBidRateLimit } from "./rate-limiter";
 
 type BidResult =
   | { success: true; bid: { id: string; amount: number; participantName: string } }
-  | { success: false; reason: string };
+  | { success: false; reason: string; retryAfterMs?: number };
 
 export async function placeBid(
   itemId: string,
   amount: number,
   participantId: string
 ): Promise<BidResult> {
+  // Rate limit check first (cheapest check)
+  const rateLimit = await checkBidRateLimit(participantId);
+  if (!rateLimit.allowed) {
+    return {
+      success: false,
+      reason: "Too many bids, slow down",
+      retryAfterMs: rateLimit.retryAfterMs,
+    };
+  }
+
   // Fetch item and participant in parallel
   const [item, participant] = await Promise.all([
     prisma.item.findUnique({ where: { id: itemId } }),
@@ -26,62 +37,78 @@ export async function placeBid(
     return { success: false, reason: "Participant not in this session" };
 
   // Validate amount
-  const minRequired = item.currentBid
-    ? item.currentBid + 1
-    : item.minBid;
+  const minRequired = item.currentBid ? item.currentBid + 1 : item.minBid;
   if (amount < minRequired)
     return { success: false, reason: `Bid must be at least $${minRequired}` };
 
-  // Budget check
+  // Pre-check budget (non-atomic, but catches obvious cases early)
   if (participant.budget === null || amount > participant.budget)
     return { success: false, reason: "Insufficient budget" };
 
-  // Optimistic lock: only update if version matches and bid exceeds current
-  const currentBid = item.currentBid ?? 0;
-
+  // Atomic transaction: optimistic lock on item + budget guard on participant
+  // This prevents both:
+  // 1. Two different bidders racing on the same item (version check)
+  // 2. Same bidder overspending via simultaneous bids (budget check)
   try {
-    const updated = await prisma.item.updateMany({
-      where: {
-        id: itemId,
-        version: item.version,
-        OR: [
-          { currentBid: null },
-          { currentBid: { lt: amount } },
-        ],
-      },
-      data: {
-        currentBid: amount,
-        version: { increment: 1 },
-        winnerId: participantId,
-      },
+    const result = await prisma.$transaction(async (tx) => {
+      // Re-read participant budget inside transaction for atomicity
+      const freshParticipant = await tx.participant.findUnique({
+        where: { id: participantId },
+        select: { budget: true, name: true },
+      });
+
+      if (!freshParticipant || freshParticipant.budget === null || amount > freshParticipant.budget) {
+        return { success: false as const, reason: "Insufficient budget" };
+      }
+
+      // Optimistic lock: only update if version matches and bid exceeds current
+      const updated = await tx.item.updateMany({
+        where: {
+          id: itemId,
+          version: item.version,
+          status: "ACTIVE",
+          OR: [
+            { currentBid: null },
+            { currentBid: { lt: amount } },
+          ],
+        },
+        data: {
+          currentBid: amount,
+          version: { increment: 1 },
+          winnerId: participantId,
+        },
+      });
+
+      if (updated.count === 0) {
+        return {
+          success: false as const,
+          reason: "Bid was outbid or item state changed",
+        };
+      }
+
+      // Create bid record
+      await tx.bid.create({
+        data: { amount, itemId, participantId },
+      });
+
+      return {
+        success: true as const,
+        participantName: freshParticipant.name,
+      };
     });
 
-    if (updated.count === 0) {
-      return { success: false, reason: "Bid was outbid or item state changed" };
+    if (!result.success) {
+      return { success: false, reason: result.reason };
     }
 
-    // Create bid record
-    await prisma.bid.create({
-      data: {
-        amount,
-        itemId,
-        participantId,
-      },
-    });
-
     logger.info(
-      {
-        itemId,
-        participantId,
-        amount,
-        previousBid: currentBid,
-      },
+      { itemId, participantId, amount, previousBid: item.currentBid ?? 0 },
       "Bid placed"
     );
 
     return {
       success: true,
-      bid: { id: itemId, amount, participantName: participant.name },
+      bid: { id: itemId, amount, participantName: result.participantName },
     };
   } catch (err) {
     logger.error({ err, itemId, participantId }, "Bid failed");
@@ -102,7 +129,7 @@ export async function awardItem(itemId: string): Promise<{
   if (!item) return { sold: false };
 
   if (item.winnerId && item.currentBid && item.winner) {
-    // Deduct budget from winner
+    // Atomic: mark item sold + deduct budget
     await prisma.$transaction([
       prisma.item.update({
         where: { id: itemId },
