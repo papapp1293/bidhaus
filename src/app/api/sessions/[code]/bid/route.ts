@@ -2,12 +2,14 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/server/db";
 import { placeBidSchema } from "@/lib/validators";
 import { placeBid } from "@/server/bid-service";
-import { logger } from "@/lib/logger";
+import { getRequestLogger } from "@/lib/tracing";
 
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ code: string }> }
 ) {
+  const { log } = getRequestLogger(request);
+
   try {
     const { code } = await params;
     const body = await request.json();
@@ -52,7 +54,7 @@ export async function POST(
 
     return NextResponse.json(result.bid, { status: 201 });
   } catch (error) {
-    logger.error({ error }, "Bid API failed");
+    log.error({ error }, "Bid API failed");
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 }

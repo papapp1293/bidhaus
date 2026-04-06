@@ -19,6 +19,7 @@ import {
 } from "./queue";
 import { ITEM_EXPIRY_CHANNEL } from "@/worker/jobs/item-expiry";
 import { cacheInvalidate, CacheKeys } from "./cache";
+import { HOST_DISCONNECT_GRACE_MS } from "@/lib/constants";
 
 export type ServerToClientEvents = {
   "bid:new": (data: {
@@ -43,6 +44,25 @@ export type ServerToClientEvents = {
   "session:paused": () => void;
   "session:resumed": () => void;
   "session:completed": (data: { results: unknown }) => void;
+  "state:sync": (data: {
+    sessionStatus: string;
+    currentItem: {
+      id: string;
+      name: string;
+      description?: string | null;
+      minBid: number;
+      order: number;
+      currentBid: number | null;
+    } | null;
+    endsAt: string | null;
+    participants: {
+      id: string;
+      name: string;
+      role: string;
+      budget: number | null;
+      connected: boolean;
+    }[];
+  }) => void;
   "participant:joined": (data: { name: string; role: string }) => void;
   "participant:left": (data: { name: string }) => void;
   "presence:update": (data: {
@@ -143,6 +163,9 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
         // Send presence update to all
         await broadcastPresence(io, sessionCode);
 
+        // Send full state sync to the reconnecting client
+        await sendStateSync(socket, participant.session);
+
         logger.info(
           { socketId: socket.id, participant: participant.name, room },
           "Participant joined room"
@@ -210,6 +233,14 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
         // Join host to the room
         socket.join(room);
         socket.data = { sessionCode: session.code, isHost: true };
+
+        // Clear grace timer if host reconnected
+        const graceTimer = hostGraceTimers.get(session.code);
+        if (graceTimer) {
+          clearTimeout(graceTimer);
+          hostGraceTimers.delete(session.code);
+          logger.info({ sessionCode: session.code }, "Host reconnected, grace period cancelled");
+        }
 
         io.to(room).emit("session:started");
 
@@ -339,7 +370,7 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
     });
 
     socket.on("disconnect", async () => {
-      const { participantId, sessionCode } = socket.data ?? {};
+      const { participantId, sessionCode, isHost } = socket.data ?? {};
 
       if (participantId) {
         try {
@@ -364,9 +395,67 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
         }
       }
 
+      // Host disconnect grace period
+      if (isHost && sessionCode) {
+        logger.info(
+          { sessionCode, graceMs: HOST_DISCONNECT_GRACE_MS },
+          "Host disconnected, starting grace period"
+        );
+
+        hostGraceTimers.set(
+          sessionCode,
+          setTimeout(async () => {
+            hostGraceTimers.delete(sessionCode);
+            // Check if host reconnected
+            const room = `session:${sessionCode}`;
+            const sockets = await io.in(room).fetchSockets();
+            const hostReconnected = sockets.some((s) => s.data?.isHost);
+
+            if (!hostReconnected) {
+              logger.warn({ sessionCode }, "Host did not reconnect within grace period");
+              // Session continues — items still expire via BullMQ
+              // Just log, don't kill the session
+            }
+          }, HOST_DISCONNECT_GRACE_MS)
+        );
+      }
+
       logger.info({ socketId: socket.id }, "Socket disconnected");
     });
   });
+
+  // --- Stale connection cleanup (every 30s) ---
+  const STALE_CLEANUP_INTERVAL_MS = 30_000;
+  setInterval(async () => {
+    try {
+      // Find all participants marked as connected
+      const connectedParticipants = await prisma.participant.findMany({
+        where: { connected: true },
+        include: { session: { select: { code: true } } },
+      });
+
+      for (const participant of connectedParticipants) {
+        const room = `session:${participant.session.code}`;
+        const sockets = await io.in(room).fetchSockets();
+        const hasSocket = sockets.some(
+          (s) => s.data?.participantId === participant.id
+        );
+
+        if (!hasSocket) {
+          await prisma.participant.update({
+            where: { id: participant.id },
+            data: { connected: false },
+          });
+          logger.info(
+            { participantId: participant.id, name: participant.name },
+            "Cleaned up stale connection"
+          );
+        }
+      }
+    } catch (err) {
+      logger.error({ err }, "Error in stale connection cleanup");
+    }
+  }, STALE_CLEANUP_INTERVAL_MS);
 
   // --- Worker bridge: subscribe to item expiry events from BullMQ worker ---
   const workerSub = new Redis(redisUrl, { lazyConnect: true });
@@ -429,6 +518,53 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
   return io;
 }
 
+async function sendStateSync(
+  socket: Parameters<Parameters<AppSocketServer["on"]>[1]>[0],
+  session: { id: string; status: string; currentItemIdx: number | null; code: string }
+) {
+  try {
+    // Get current active item
+    let currentItem = null;
+    if (session.currentItemIdx !== null) {
+      const items = await prisma.item.findMany({
+        where: { sessionId: session.id },
+        orderBy: { order: "asc" },
+      });
+      const active = items[session.currentItemIdx];
+      if (active && active.status === "ACTIVE") {
+        currentItem = {
+          id: active.id,
+          name: active.name,
+          description: active.description,
+          minBid: active.minBid,
+          order: active.order,
+          currentBid: active.currentBid,
+        };
+      }
+    }
+
+    // Get timer state
+    const timerEnd = await getTimerEnd(session.id);
+    const endsAt = timerEnd ? new Date(timerEnd).toISOString() : null;
+
+    // Get participants
+    const participants = await prisma.participant.findMany({
+      where: { sessionId: session.id },
+      select: { id: true, name: true, role: true, budget: true, connected: true },
+      orderBy: { joinedAt: "asc" },
+    });
+
+    socket.emit("state:sync", {
+      sessionStatus: session.status,
+      currentItem,
+      endsAt,
+      participants,
+    });
+  } catch (err) {
+    logger.error({ err }, "Error sending state sync");
+  }
+}
+
 async function broadcastPresence(io: AppSocketServer, sessionCode: string) {
   const participants = await prisma.participant.findMany({
     where: { session: { code: sessionCode } },
@@ -454,6 +590,7 @@ function findRoomForSocket(socket: { rooms: Set<string> }): string | null {
 
 // Timer management
 const timerIntervals = new Map<string, NodeJS.Timeout>();
+const hostGraceTimers = new Map<string, NodeJS.Timeout>();
 
 function scheduleTimerSync(
   io: AppSocketServer,

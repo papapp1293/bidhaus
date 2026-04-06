@@ -124,6 +124,18 @@ export default function LivePage() {
     if (!connected) return;
 
     const unsubs = [
+      on("state:sync", (data) => {
+        setSessionStatus(data.sessionStatus);
+        setParticipants(data.participants as Participant[]);
+        if (data.currentItem) {
+          setCurrentItem(data.currentItem);
+          setCurrentBid(data.currentItem.currentBid);
+          setEndsAt(data.endsAt);
+        }
+        if (data.sessionStatus === "COMPLETED") {
+          router.push(`/session/${code}/results`);
+        }
+      }),
       on("item:start", (data) => {
         setCurrentItem(data.item);
         setEndsAt(data.endsAt);
