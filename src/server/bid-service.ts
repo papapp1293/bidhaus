@@ -1,6 +1,7 @@
 import { prisma } from "./db";
 import { logger } from "@/lib/logger";
 import { checkBidRateLimit } from "./rate-limiter";
+import { cacheSet, cacheInvalidate, CacheKeys } from "./cache";
 
 type BidResult =
   | { success: true; bid: { id: string; amount: number; participantName: string } }
@@ -21,9 +22,12 @@ export async function placeBid(
     };
   }
 
-  // Fetch item and participant in parallel
+  // Fetch item (with session code for cache invalidation) and participant in parallel
   const [item, participant] = await Promise.all([
-    prisma.item.findUnique({ where: { id: itemId } }),
+    prisma.item.findUnique({
+      where: { id: itemId },
+      include: { session: { select: { code: true } } },
+    }),
     prisma.participant.findUnique({ where: { id: participantId } }),
   ]);
 
@@ -101,6 +105,12 @@ export async function placeBid(
       return { success: false, reason: result.reason };
     }
 
+    // Invalidate caches: active item state + session (budget changed)
+    await cacheInvalidate(
+      CacheKeys.activeItem(item.sessionId),
+      CacheKeys.session(item.session.code)
+    );
+
     logger.info(
       { itemId, participantId, amount, previousBid: item.currentBid ?? 0 },
       "Bid placed"
@@ -123,7 +133,7 @@ export async function awardItem(itemId: string): Promise<{
 }> {
   const item = await prisma.item.findUnique({
     where: { id: itemId },
-    include: { winner: true },
+    include: { winner: true, session: { select: { code: true } } },
   });
 
   if (!item) return { sold: false };
@@ -140,6 +150,12 @@ export async function awardItem(itemId: string): Promise<{
         data: { budget: { decrement: item.currentBid } },
       }),
     ]);
+
+    // Invalidate caches after award
+    await cacheInvalidate(
+      CacheKeys.activeItem(item.sessionId),
+      CacheKeys.session(item.session.code)
+    );
 
     logger.info(
       { itemId, winner: item.winner.name, amount: item.currentBid },
@@ -158,6 +174,12 @@ export async function awardItem(itemId: string): Promise<{
     where: { id: itemId },
     data: { status: "UNSOLD" },
   });
+
+  // Invalidate caches after unsold
+  await cacheInvalidate(
+    CacheKeys.activeItem(item.sessionId),
+    CacheKeys.session(item.session.code)
+  );
 
   logger.info({ itemId }, "Item unsold");
   return { sold: false };
@@ -189,6 +211,10 @@ export async function advanceToNextItem(sessionId: string): Promise<{
       where: { id: sessionId },
       data: { status: "COMPLETED", currentItemIdx: nextIdx },
     });
+    await cacheInvalidate(
+      CacheKeys.activeItem(sessionId),
+      CacheKeys.session(session.code)
+    );
     return { item: null, completed: true };
   }
 
@@ -203,6 +229,25 @@ export async function advanceToNextItem(sessionId: string): Promise<{
       data: { status: "ACTIVE" },
     }),
   ]);
+
+  // Cache the new active item
+  await cacheInvalidate(CacheKeys.activeItem(sessionId));
+  await cacheSet(
+    CacheKeys.activeItem(sessionId),
+    {
+      id: nextItem.id,
+      name: nextItem.name,
+      description: nextItem.description,
+      minBid: nextItem.minBid,
+      order: nextItem.order,
+      currentBid: null,
+      winnerId: null,
+    },
+    session.timePerItem + 10 // TTL slightly longer than item duration
+  );
+
+  // Invalidate session cache (currentItemIdx changed)
+  await cacheInvalidate(CacheKeys.session(session.code));
 
   return {
     item: {

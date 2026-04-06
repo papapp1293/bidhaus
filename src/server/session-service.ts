@@ -1,5 +1,6 @@
 import { prisma } from "./db";
 import { generateInviteCode, generateToken } from "@/lib/invite-codes";
+import { cacheFetch, cacheInvalidate, CacheKeys } from "./cache";
 import type {
   CreateSessionInput,
   JoinSessionInput,
@@ -25,22 +26,27 @@ export async function createSession(input: CreateSessionInput) {
 }
 
 export async function getSessionByCode(code: string) {
-  return prisma.session.findUnique({
-    where: { code },
-    include: {
-      items: { orderBy: { order: "asc" } },
-      participants: {
-        select: {
-          id: true,
-          name: true,
-          role: true,
-          budget: true,
-          connected: true,
-          joinedAt: true,
+  return cacheFetch(
+    CacheKeys.session(code),
+    () =>
+      prisma.session.findUnique({
+        where: { code },
+        include: {
+          items: { orderBy: { order: "asc" } },
+          participants: {
+            select: {
+              id: true,
+              name: true,
+              role: true,
+              budget: true,
+              connected: true,
+              joinedAt: true,
+            },
+          },
         },
-      },
-    },
-  });
+      }),
+    30 // 30s TTL — active sessions change frequently
+  );
 }
 
 export async function joinSession(
@@ -75,6 +81,9 @@ export async function joinSession(
       budget: input.role === "BIDDER" ? session.budgetPerBidder : null,
     },
   });
+
+  // Invalidate session cache (participant list changed)
+  await cacheInvalidate(CacheKeys.session(code));
 
   return { participant, token };
 }

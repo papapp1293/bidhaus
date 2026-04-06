@@ -18,6 +18,7 @@ import {
   enqueueResultsSummary,
 } from "./queue";
 import { ITEM_EXPIRY_CHANNEL } from "@/worker/jobs/item-expiry";
+import { cacheInvalidate, CacheKeys } from "./cache";
 
 export type ServerToClientEvents = {
   "bid:new": (data: {
@@ -201,6 +202,7 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
           where: { id: session.id },
           data: { status: "LIVE" },
         });
+        await cacheInvalidate(CacheKeys.session(session.code));
 
         const result = await advanceToNextItem(session.id);
         const room = `session:${session.code}`;
@@ -249,6 +251,7 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
           where: { id: session.id },
           data: { status: "PAUSED" },
         });
+        await cacheInvalidate(CacheKeys.session(session.code));
 
         io.to(`session:${session.code}`).emit("session:paused");
       } catch (err) {
@@ -267,6 +270,7 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
           where: { id: session.id },
           data: { status: "LIVE" },
         });
+        await cacheInvalidate(CacheKeys.session(session.code));
 
         io.to(`session:${session.code}`).emit("session:resumed");
       } catch (err) {
