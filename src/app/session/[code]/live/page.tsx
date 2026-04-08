@@ -32,12 +32,19 @@ type BidEntry = {
   timestamp: string;
 };
 
+type WonItem = {
+  id: string;
+  name: string;
+  currentBid: number | null;
+};
+
 type Participant = {
   id: string;
   name: string;
   role: string;
   budget: number | null;
   connected: boolean;
+  wonItems?: WonItem[];
 };
 
 export default function LivePage() {
@@ -48,6 +55,7 @@ export default function LivePage() {
   const [isHost, setIsHost] = useState(false);
   const [hostToken, setHostToken] = useState<string | null>(null);
   const [participantToken, setParticipantToken] = useState<string | null>(null);
+  const [participantId, setParticipantId] = useState<string | null>(null);
   const [role, setRole] = useState<string | null>(null);
   const [myBudget, setMyBudget] = useState<number>(0);
 
@@ -59,6 +67,7 @@ export default function LivePage() {
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [sessionStatus, setSessionStatus] = useState<string>("LIVE");
   const [lastEvent, setLastEvent] = useState<string>("");
+  const [round, setRound] = useState<number>(1);
 
   const socketToken = participantToken ?? hostToken;
   const { connected, emit, on } = useSocket(code, socketToken);
@@ -67,6 +76,7 @@ export default function LivePage() {
   useEffect(() => {
     const hToken = sessionStorage.getItem(`host:${code}`);
     const pToken = sessionStorage.getItem(`participant:${code}`);
+    const pId = sessionStorage.getItem(`participantId:${code}`);
 
     if (hToken) {
       setIsHost(true);
@@ -74,6 +84,9 @@ export default function LivePage() {
     }
     if (pToken) {
       setParticipantToken(pToken);
+    }
+    if (pId) {
+      setParticipantId(pId);
     }
 
     // Fetch initial session state
@@ -91,30 +104,24 @@ export default function LivePage() {
         setSessionStatus(data.status);
         setParticipants(data.participants);
 
-        // Find current active item
-        if (data.currentItemIdx !== null && data.items[data.currentItemIdx]) {
-          const item = data.items[data.currentItemIdx];
-          setCurrentItem(item);
-          setCurrentBid(item.currentBid);
+        // Find current active item by status (items can re-cycle across rounds)
+        const activeItem = (data.items as Array<{ status: string; currentBid: number | null } & CurrentItem>).find(
+          (i) => i.status === "ACTIVE"
+        );
+        if (activeItem) {
+          setCurrentItem(activeItem);
+          setCurrentBid(activeItem.currentBid);
         }
 
-        // Set role and budget
-        if (pToken) {
+        // Find self by participantId
+        if (pId) {
           const me = data.participants.find(
-            () => true // We'll match by token on the server
+            (p: Participant) => p.id === pId
           );
-          // Fetch own info
-          fetch(`/api/sessions/${code}`)
-            .then((r) => r.json())
-            .then((d) => {
-              const participant = d.participants.find(
-                (p: Participant) => p.connected
-              );
-              if (participant) {
-                setRole(participant.role);
-                setMyBudget(participant.budget ?? 0);
-              }
-            });
+          if (me) {
+            setRole(me.role);
+            setMyBudget(me.budget ?? 0);
+          }
         }
       });
   }, [code, router]);
@@ -127,10 +134,18 @@ export default function LivePage() {
       on("state:sync", (data) => {
         setSessionStatus(data.sessionStatus);
         setParticipants(data.participants as Participant[]);
+        setLastEvent("");
         if (data.currentItem) {
           setCurrentItem(data.currentItem);
           setCurrentBid(data.currentItem.currentBid);
           setEndsAt(data.endsAt);
+        }
+        if (participantId) {
+          const me = data.participants.find((p) => p.id === participantId);
+          if (me) {
+            setRole(me.role);
+            if (me.budget !== null) setMyBudget(me.budget);
+          }
         }
         if (data.sessionStatus === "COMPLETED") {
           router.push(`/session/${code}/results`);
@@ -152,6 +167,7 @@ export default function LivePage() {
       }),
       on("timer:sync", (data) => {
         setServerRemainingMs(data.remainingMs);
+        if (data.endsAt) setEndsAt(data.endsAt);
       }),
       on("item:sold", (data) => {
         setLastEvent(`Sold to ${data.winner} for $${data.amount}!`);
@@ -161,26 +177,33 @@ export default function LivePage() {
         setLastEvent("Item went unsold");
         setCurrentItem(null);
       }),
-      on("session:paused", () => {
+      on("session:paused", (data) => {
         setSessionStatus("PAUSED");
+        if (data?.remainingMs !== undefined) {
+          setServerRemainingMs(data.remainingMs);
+          // Freeze the displayed timer at the paused remaining
+          setEndsAt(new Date(Date.now() + data.remainingMs).toISOString());
+        }
       }),
-      on("session:resumed", () => {
+      on("session:resumed", (data) => {
         setSessionStatus("LIVE");
+        if (data?.endsAt) {
+          setEndsAt(data.endsAt);
+          setServerRemainingMs(data.remainingMs);
+        }
       }),
       on("session:completed", () => {
         setSessionStatus("COMPLETED");
         router.push(`/session/${code}/results`);
       }),
+      on("round:restarted", () => {
+        setRound((r) => r + 1);
+        setLastEvent("New round: unsold items are back on the block");
+      }),
       on("presence:update", (data) => {
         setParticipants(data.participants as Participant[]);
-        // Update own budget
-        if (participantToken) {
-          // Find self by looking at connected bidders
-          const bidders = data.participants.filter(
-            (p) => p.role === "BIDDER"
-          );
-          // We'll track budget from presence updates
-          const me = bidders.find((p) => p.connected);
+        if (participantId) {
+          const me = data.participants.find((p) => p.id === participantId);
           if (me && me.budget !== null) {
             setMyBudget(me.budget);
           }
@@ -189,7 +212,7 @@ export default function LivePage() {
     ];
 
     return () => unsubs.forEach((u) => u());
-  }, [connected, on, code, router, participantToken]);
+  }, [connected, on, code, router, participantId]);
 
   const handleBid = useCallback(
     (amount: number) => {
@@ -223,8 +246,11 @@ export default function LivePage() {
           <div className="flex items-center justify-between">
             <h1 className="text-lg font-bold">Live Auction</h1>
             <div className="flex items-center gap-2">
+              {round > 1 && (
+                <Badge variant="outline">Round {round}</Badge>
+              )}
               <Badge variant={connected ? "default" : "secondary"}>
-                {connected ? "Live" : "Reconnecting..."}
+                {connected ? "Online" : "Reconnecting..."}
               </Badge>
               <Badge
                 variant={
@@ -254,6 +280,7 @@ export default function LivePage() {
                   <CountdownTimer
                     endsAt={endsAt}
                     serverRemainingMs={serverRemainingMs}
+                    paused={sessionStatus === "PAUSED"}
                   />
 
                   {isBidder && sessionStatus === "LIVE" && (
@@ -336,7 +363,7 @@ export default function LivePage() {
                 bidders={bidders.map((b) => ({
                   name: b.name,
                   budget: b.budget,
-                  wonItems: [],
+                  wonItems: b.wonItems ?? [],
                 }))}
               />
             </CardContent>

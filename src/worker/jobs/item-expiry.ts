@@ -53,11 +53,10 @@ export async function processItemExpiry(job: Job<ItemExpiryJobData>) {
     );
   }
 
-  if (next.completed) {
-    await enqueueResultsSummary(sessionId);
-  }
-
-  // Publish result to Redis so the socket server can broadcast
+  // Publish result to Redis so the socket server can broadcast.
+  // This MUST happen before any other optional work (e.g. results summary
+  // enqueue) so that a failure downstream can never prevent clients from
+  // learning that the item closed / the session completed.
   const { redis } = await import("@/server/redis");
   await redis.publish(
     ITEM_EXPIRY_CHANNEL,
@@ -71,14 +70,27 @@ export async function processItemExpiry(job: Job<ItemExpiryJobData>) {
         amount: award.amount ?? null,
       },
       next: next.completed
-        ? { completed: true, item: null, endsAt: null }
+        ? { completed: true, item: null, endsAt: null, roundRestarted: !!next.roundRestarted }
         : {
             completed: false,
             item: next.item,
             endsAt: nextEndsAt ? new Date(nextEndsAt).toISOString() : null,
+            roundRestarted: !!next.roundRestarted,
           },
     })
   );
+
+  if (next.completed) {
+    try {
+      await enqueueResultsSummary(sessionId);
+    } catch (err) {
+      // Non-fatal: results API falls back to on-the-fly generation.
+      logger.error(
+        { err, sessionId },
+        "Failed to enqueue results summary (non-fatal)"
+      );
+    }
+  }
 
   logger.info(
     { itemId, sold: award.sold, nextItem: next.item?.id ?? null },

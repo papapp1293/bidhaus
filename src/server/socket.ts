@@ -10,6 +10,9 @@ import {
   getTimerEnd,
   clearTimer,
   getRemainingMs,
+  pauseItemTimer,
+  resumeItemTimer,
+  ensureMinRemaining,
   TIMER_SYNC_INTERVAL_MS,
 } from "./timer-service";
 import {
@@ -39,11 +42,12 @@ export type ServerToClientEvents = {
     amount: number;
   }) => void;
   "item:unsold": (data: { itemId: string }) => void;
-  "timer:sync": (data: { remainingMs: number }) => void;
+  "timer:sync": (data: { remainingMs: number; endsAt?: string }) => void;
   "session:started": () => void;
-  "session:paused": () => void;
-  "session:resumed": () => void;
+  "session:paused": (data: { remainingMs: number }) => void;
+  "session:resumed": (data: { endsAt: string; remainingMs: number }) => void;
   "session:completed": (data: { results: unknown }) => void;
+  "round:restarted": () => void;
   "state:sync": (data: {
     sessionStatus: string;
     currentItem: {
@@ -61,6 +65,7 @@ export type ServerToClientEvents = {
       role: string;
       budget: number | null;
       connected: boolean;
+      wonItems: { id: string; name: string; currentBid: number | null }[];
     }[];
   }) => void;
   "participant:joined": (data: { name: string; role: string }) => void;
@@ -72,6 +77,7 @@ export type ServerToClientEvents = {
       role: string;
       budget: number | null;
       connected: boolean;
+      wonItems: { id: string; name: string; currentBid: number | null }[];
     }[];
   }) => void;
 };
@@ -132,7 +138,36 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
 
     socket.on("participant:join", async ({ sessionCode, token }) => {
       try {
-        // Find participant by token
+        const room = `session:${sessionCode}`;
+
+        // Check if this is a host token first
+        const hostSession = await prisma.session.findUnique({
+          where: { code: sessionCode },
+        });
+
+        if (hostSession && hostSession.hostToken === token) {
+          socket.join(room);
+          socket.data = { sessionCode, isHost: true };
+
+          // Clear grace timer if host reconnected
+          const graceTimer = hostGraceTimers.get(sessionCode);
+          if (graceTimer) {
+            clearTimeout(graceTimer);
+            hostGraceTimers.delete(sessionCode);
+            logger.info({ sessionCode }, "Host reconnected, grace period cancelled");
+          }
+
+          await broadcastPresence(io, sessionCode);
+          await sendStateSync(socket, hostSession);
+
+          logger.info(
+            { socketId: socket.id, room, isHost: true },
+            "Host joined room"
+          );
+          return;
+        }
+
+        // Otherwise look up as participant
         const participant = await prisma.participant.findUnique({
           where: { token },
           include: { session: true },
@@ -144,7 +179,6 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
         }
 
         // Join the session room
-        const room = `session:${sessionCode}`;
         socket.join(room);
         socket.data = { sessionCode, participantId: participant.id, token };
 
@@ -204,6 +238,34 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
           // Broadcast updated budgets
           const sessionCode = socket.data?.sessionCode;
           if (sessionCode) await broadcastPresence(io, sessionCode);
+
+          // If the bid extended the timer, reschedule expiry job and broadcast new endsAt
+          if (result.timerExtended) {
+            const session = await prisma.session.findUnique({
+              where: { id: participant.sessionId },
+            });
+            if (session) {
+              await scheduleItemExpiryJob(
+                {
+                  sessionId: session.id,
+                  sessionCode: session.code,
+                  itemId,
+                  timePerItem: session.timePerItem,
+                },
+                result.timerExtended.remainingMs
+              );
+              scheduleTimerSync(
+                io,
+                session.code,
+                session.id,
+                result.timerExtended.endsAt
+              );
+              io.to(room).emit("timer:sync", {
+                remainingMs: result.timerExtended.remainingMs,
+                endsAt: new Date(result.timerExtended.endsAt).toISOString(),
+              });
+            }
+          }
         }
       } catch (err) {
         logger.error({ err }, "Error handling bid:place");
@@ -278,13 +340,31 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
         });
         if (!session || session.status !== "LIVE") return;
 
+        // Find currently active item (if any) and cancel its expiry job
+        const activeItem = await prisma.item.findFirst({
+          where: { sessionId: session.id, status: "ACTIVE" },
+        });
+        if (activeItem) {
+          await cancelItemExpiryJob(activeItem.id);
+        }
+
+        // Capture remaining ms and stop the sync interval
+        const remainingMs = (await pauseItemTimer(session.id)) ?? 0;
+        const interval = timerIntervals.get(session.id);
+        if (interval) {
+          clearInterval(interval);
+          timerIntervals.delete(session.id);
+        }
+
         await prisma.session.update({
           where: { id: session.id },
           data: { status: "PAUSED" },
         });
         await cacheInvalidate(CacheKeys.session(session.code));
 
-        io.to(`session:${session.code}`).emit("session:paused");
+        io.to(`session:${session.code}`).emit("session:paused", {
+          remainingMs,
+        });
       } catch (err) {
         logger.error({ err }, "Error handling host:pause");
       }
@@ -297,13 +377,43 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
         });
         if (!session || session.status !== "PAUSED") return;
 
+        // Restore endsAt = now + remaining
+        const resumed = await resumeItemTimer(session.id);
+        const activeItem = await prisma.item.findFirst({
+          where: { sessionId: session.id, status: "ACTIVE" },
+        });
+
         await prisma.session.update({
           where: { id: session.id },
           data: { status: "LIVE" },
         });
         await cacheInvalidate(CacheKeys.session(session.code));
 
-        io.to(`session:${session.code}`).emit("session:resumed");
+        if (resumed && activeItem) {
+          // Reschedule expiry job with the captured remaining time
+          await scheduleItemExpiryJob(
+            {
+              sessionId: session.id,
+              sessionCode: session.code,
+              itemId: activeItem.id,
+              timePerItem: session.timePerItem,
+            },
+            resumed.remainingMs
+          );
+          // Restart the sync interval for the new endsAt
+          scheduleTimerSync(io, session.code, session.id, resumed.endsAt);
+
+          io.to(`session:${session.code}`).emit("session:resumed", {
+            endsAt: new Date(resumed.endsAt).toISOString(),
+            remainingMs: resumed.remainingMs,
+          });
+        } else {
+          // No paused timer captured (edge case) — just flip status
+          io.to(`session:${session.code}`).emit("session:resumed", {
+            endsAt: new Date(Date.now()).toISOString(),
+            remainingMs: 0,
+          });
+        }
       } catch (err) {
         logger.error({ err }, "Error handling host:resume");
       }
@@ -313,11 +423,12 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
       try {
         const session = await prisma.session.findUnique({
           where: { hostToken: token },
-          include: { items: { orderBy: { order: "asc" } } },
         });
         if (!session || session.status !== "LIVE") return;
 
-        const currentItem = session.items[session.currentItemIdx ?? 0];
+        const currentItem = await prisma.item.findFirst({
+          where: { sessionId: session.id, status: "ACTIVE" },
+        });
         if (currentItem) {
           await cancelItemExpiryJob(currentItem.id);
           await prisma.item.update({
@@ -340,11 +451,12 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
       try {
         const session = await prisma.session.findUnique({
           where: { hostToken: token },
-          include: { items: { orderBy: { order: "asc" } } },
         });
         if (!session || session.status !== "LIVE") return;
 
-        const currentItem = session.items[session.currentItemIdx ?? 0];
+        const currentItem = await prisma.item.findFirst({
+          where: { sessionId: session.id, status: "ACTIVE" },
+        });
         if (!currentItem) return;
 
         await cancelItemExpiryJob(currentItem.id);
@@ -483,6 +595,12 @@ export function createSocketServer(httpServer: HttpServer): AppSocketServer {
         io.to(room).emit("item:unsold", { itemId: data.award.itemId });
       }
 
+      // Announce round restart (before the next item:start so clients
+      // can show a banner explaining why an already-seen item reappears).
+      if (data.next.roundRestarted) {
+        io.to(room).emit("round:restarted");
+      }
+
       // Broadcast next item or session completion
       if (data.next.completed) {
         const session = await prisma.session.findUnique({
@@ -523,24 +641,20 @@ async function sendStateSync(
   session: { id: string; status: string; currentItemIdx: number | null; code: string }
 ) {
   try {
-    // Get current active item
+    // Get current active item by status (not by index — items can re-cycle across rounds)
     let currentItem = null;
-    if (session.currentItemIdx !== null) {
-      const items = await prisma.item.findMany({
-        where: { sessionId: session.id },
-        orderBy: { order: "asc" },
-      });
-      const active = items[session.currentItemIdx];
-      if (active && active.status === "ACTIVE") {
-        currentItem = {
-          id: active.id,
-          name: active.name,
-          description: active.description,
-          minBid: active.minBid,
-          order: active.order,
-          currentBid: active.currentBid,
-        };
-      }
+    const active = await prisma.item.findFirst({
+      where: { sessionId: session.id, status: "ACTIVE" },
+    });
+    if (active) {
+      currentItem = {
+        id: active.id,
+        name: active.name,
+        description: active.description,
+        minBid: active.minBid,
+        order: active.order,
+        currentBid: active.currentBid,
+      };
     }
 
     // Get timer state
@@ -548,11 +662,24 @@ async function sendStateSync(
     const endsAt = timerEnd ? new Date(timerEnd).toISOString() : null;
 
     // Get participants
-    const participants = await prisma.participant.findMany({
+    const rows = await prisma.participant.findMany({
       where: { sessionId: session.id },
-      select: { id: true, name: true, role: true, budget: true, connected: true },
+      include: {
+        wonItems: {
+          select: { id: true, name: true, currentBid: true },
+          orderBy: { order: "asc" },
+        },
+      },
       orderBy: { joinedAt: "asc" },
     });
+    const participants = rows.map((p) => ({
+      id: p.id,
+      name: p.name,
+      role: p.role,
+      budget: p.budget,
+      connected: p.connected,
+      wonItems: p.wonItems,
+    }));
 
     socket.emit("state:sync", {
       sessionStatus: session.status,
@@ -566,17 +693,25 @@ async function sendStateSync(
 }
 
 async function broadcastPresence(io: AppSocketServer, sessionCode: string) {
-  const participants = await prisma.participant.findMany({
+  const rows = await prisma.participant.findMany({
     where: { session: { code: sessionCode } },
-    select: {
-      id: true,
-      name: true,
-      role: true,
-      budget: true,
-      connected: true,
+    include: {
+      wonItems: {
+        select: { id: true, name: true, currentBid: true },
+        orderBy: { order: "asc" },
+      },
     },
     orderBy: { joinedAt: "asc" },
   });
+
+  const participants = rows.map((p) => ({
+    id: p.id,
+    name: p.name,
+    role: p.role,
+    budget: p.budget,
+    connected: p.connected,
+    wonItems: p.wonItems,
+  }));
 
   io.to(`session:${sessionCode}`).emit("presence:update", { participants });
 }
@@ -622,6 +757,10 @@ async function startNextItem(
   const result = await advanceToNextItem(sessionId);
   const room = `session:${sessionCode}`;
 
+  if (result.roundRestarted) {
+    io.to(room).emit("round:restarted");
+  }
+
   if (result.completed) {
     const session = await prisma.session.findUnique({
       where: { id: sessionId },
@@ -640,8 +779,16 @@ async function startNextItem(
     if (interval) clearInterval(interval);
     timerIntervals.delete(sessionId);
 
-    // Enqueue results summary generation
-    await enqueueResultsSummary(sessionId);
+    // Enqueue results summary generation (non-fatal: results API falls
+    // back to on-the-fly generation if this fails).
+    try {
+      await enqueueResultsSummary(sessionId);
+    } catch (err) {
+      logger.error(
+        { err, sessionId },
+        "Failed to enqueue results summary (non-fatal)"
+      );
+    }
     return;
   }
 

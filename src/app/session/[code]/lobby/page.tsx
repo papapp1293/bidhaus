@@ -53,9 +53,9 @@ export default function LobbyPage() {
   const [isHost, setIsHost] = useState(false);
   const [hostToken, setHostToken] = useState<string | null>(null);
 
-  // Get token for socket connection
+  // Get token for socket connection (host or participant)
   const [socketToken, setSocketToken] = useState<string | null>(null);
-  const { connected, on } = useSocket(code, socketToken);
+  const { connected, on, emit } = useSocket(code, socketToken);
 
   const fetchSession = useCallback(async () => {
     try {
@@ -81,23 +81,35 @@ export default function LobbyPage() {
       setHostToken(hToken);
     }
 
-    // Use participant token for socket if available, otherwise fall back to polling
+    // Use participant token for socket if available, otherwise host token
     const pToken = sessionStorage.getItem(`participant:${code}`);
     if (pToken) {
       setSocketToken(pToken);
+    } else if (hToken) {
+      setSocketToken(hToken);
     }
   }, [code, fetchSession]);
 
-  // Listen for real-time presence updates
+  // Listen for real-time presence updates and session start
   useEffect(() => {
     if (!connected) return;
 
-    const unsub = on("presence:update", (data) => {
-      setParticipants(data.participants as Participant[]);
-    });
+    const unsubs = [
+      on("presence:update", (data) => {
+        setParticipants(data.participants as Participant[]);
+      }),
+      on("session:started", () => {
+        router.push(`/session/${code}/live`);
+      }),
+      on("state:sync", (data) => {
+        if (data.sessionStatus === "LIVE" || data.sessionStatus === "PAUSED") {
+          router.push(`/session/${code}/live`);
+        }
+      }),
+    ];
 
-    return unsub;
-  }, [connected, on]);
+    return () => unsubs.forEach((u) => u());
+  }, [connected, on, code, router]);
 
   // Fall back to polling if not connected via WebSocket
   useEffect(() => {
@@ -138,7 +150,7 @@ export default function LobbyPage() {
                 </CardDescription>
               </div>
               <Badge variant={connected ? "default" : "secondary"}>
-                {connected ? "Live" : "Polling"}
+                {connected ? "Online" : "Polling"}
               </Badge>
             </div>
           </CardHeader>
@@ -186,18 +198,12 @@ export default function LobbyPage() {
           <Button
             size="lg"
             className="w-full"
-            onClick={async () => {
-              const res = await fetch(`/api/sessions/${code}/control`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ token: hostToken, action: "start" }),
-              });
-              if (res.ok) {
-                router.push(`/session/${code}/live`);
-              }
+            disabled={!connected}
+            onClick={() => {
+              emit("host:start", { token: hostToken });
             }}
           >
-            Start Auction
+            {connected ? "Start Auction" : "Connecting..."}
           </Button>
         )}
 

@@ -67,6 +67,7 @@ export default function JoinPage() {
 
       const data = await res.json();
       sessionStorage.setItem(`participant:${code}`, data.token);
+      sessionStorage.setItem(`participantId:${code}`, data.participantId);
       router.push(`/session/${code}/lobby`);
     } catch {
       setError("Network error");

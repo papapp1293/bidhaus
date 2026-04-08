@@ -5,9 +5,11 @@ import { useState, useEffect, useRef } from "react";
 export function CountdownTimer({
   endsAt,
   serverRemainingMs,
+  paused = false,
 }: {
   endsAt: string | null;
   serverRemainingMs?: number;
+  paused?: boolean;
 }) {
   const [remaining, setRemaining] = useState(0);
   const endTimeRef = useRef<number>(0);
@@ -16,18 +18,23 @@ export function CountdownTimer({
   useEffect(() => {
     if (serverRemainingMs !== undefined) {
       endTimeRef.current = Date.now() + serverRemainingMs;
+      if (paused) setRemaining(serverRemainingMs);
     }
-  }, [serverRemainingMs]);
+  }, [serverRemainingMs, paused]);
 
   // Set end time from endsAt prop
   useEffect(() => {
     if (endsAt) {
       endTimeRef.current = new Date(endsAt).getTime();
+      if (paused) {
+        setRemaining(Math.max(0, endTimeRef.current - Date.now()));
+      }
     }
-  }, [endsAt]);
+  }, [endsAt, paused]);
 
-  // Tick every 100ms
+  // Tick every 100ms (skipped while paused)
   useEffect(() => {
+    if (paused) return;
     const tick = () => {
       const r = Math.max(0, endTimeRef.current - Date.now());
       setRemaining(r);
@@ -36,7 +43,7 @@ export function CountdownTimer({
     tick();
     const interval = setInterval(tick, 100);
     return () => clearInterval(interval);
-  }, []);
+  }, [paused]);
 
   const seconds = Math.ceil(remaining / 1000);
   const isUrgent = seconds <= 5 && seconds > 0;

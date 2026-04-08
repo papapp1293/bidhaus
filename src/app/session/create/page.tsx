@@ -12,7 +12,11 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { DEFAULT_BUDGET, DEFAULT_TIME_PER_ITEM } from "@/lib/constants";
+import {
+  DEFAULT_BUDGET,
+  DEFAULT_TIME_PER_ITEM,
+  DEFAULT_RESET_TIME,
+} from "@/lib/constants";
 
 export default function CreateSessionPage() {
   const router = useRouter();
@@ -30,6 +34,8 @@ export default function CreateSessionPage() {
       hostName: form.get("hostName") as string,
       budgetPerBidder: Number(form.get("budgetPerBidder")),
       timePerItem: Number(form.get("timePerItem")),
+      resetTime: Number(form.get("resetTime")),
+      enforceEvenTeams: form.get("enforceEvenTeams") === "on",
     };
 
     try {
@@ -116,6 +122,40 @@ export default function CreateSessionPage() {
                 />
               </div>
             </div>
+
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="resetTime">
+                Reset Time on Bid (s){" "}
+                <span className="text-muted-foreground text-xs font-normal">
+                  — 0 disables; otherwise a bid extends the timer to at least this many seconds
+                </span>
+              </Label>
+              <Input
+                id="resetTime"
+                name="resetTime"
+                type="number"
+                min={0}
+                max={300}
+                defaultValue={DEFAULT_RESET_TIME}
+                required
+              />
+            </div>
+
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                name="enforceEvenTeams"
+                className="mt-1"
+              />
+              <span>
+                <span className="font-medium">Enforce even team sizes</span>
+                <span className="text-muted-foreground block text-xs">
+                  Caps each bidder at ⌈items / bidders⌉ wins. When only one
+                  bidder still has capacity, remaining items are auto-awarded
+                  to them.
+                </span>
+              </span>
+            </label>
 
             {error && (
               <p className="text-sm text-destructive">{error}</p>

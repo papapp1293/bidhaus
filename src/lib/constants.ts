@@ -1,5 +1,6 @@
 export const DEFAULT_BUDGET = 100;
 export const DEFAULT_TIME_PER_ITEM = 30; // seconds
+export const DEFAULT_RESET_TIME = 0; // seconds — 0 disables bid-driven extensions
 export const MIN_BID_INCREMENT = 1;
 export const MAX_ITEMS_PER_SESSION = 100;
 export const MAX_BIDDERS_PER_SESSION = 20;

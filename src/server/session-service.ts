@@ -19,6 +19,8 @@ export async function createSession(input: CreateSessionInput) {
       hostToken,
       budgetPerBidder: input.budgetPerBidder,
       timePerItem: input.timePerItem,
+      resetTime: input.resetTime,
+      enforceEvenTeams: input.enforceEvenTeams,
     },
   });
 

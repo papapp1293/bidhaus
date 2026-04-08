@@ -2,9 +2,27 @@ import { prisma } from "./db";
 import { logger } from "@/lib/logger";
 import { checkBidRateLimit } from "./rate-limiter";
 import { cacheSet, cacheInvalidate, CacheKeys } from "./cache";
+import { ensureMinRemaining } from "./timer-service";
+
+/**
+ * Compute the per-bidder roster cap for "enforce even teams" mode:
+ * ⌈totalItems / bidderCount⌉. Returns null if there are no bidders.
+ */
+async function computeTeamCap(sessionId: string): Promise<number | null> {
+  const [itemCount, bidderCount] = await Promise.all([
+    prisma.item.count({ where: { sessionId } }),
+    prisma.participant.count({ where: { sessionId, role: "BIDDER" } }),
+  ]);
+  if (bidderCount === 0) return null;
+  return Math.ceil(itemCount / bidderCount);
+}
 
 type BidResult =
-  | { success: true; bid: { id: string; amount: number; participantName: string } }
+  | {
+      success: true;
+      bid: { id: string; amount: number; participantName: string };
+      timerExtended?: { endsAt: number; remainingMs: number };
+    }
   | { success: false; reason: string; retryAfterMs?: number };
 
 export async function placeBid(
@@ -22,11 +40,15 @@ export async function placeBid(
     };
   }
 
-  // Fetch item (with session code for cache invalidation) and participant in parallel
+  // Fetch item (with session for cache invalidation + config) and participant in parallel
   const [item, participant] = await Promise.all([
     prisma.item.findUnique({
       where: { id: itemId },
-      include: { session: { select: { code: true } } },
+      include: {
+        session: {
+          select: { code: true, resetTime: true, enforceEvenTeams: true },
+        },
+      },
     }),
     prisma.participant.findUnique({ where: { id: participantId } }),
   ]);
@@ -39,6 +61,19 @@ export async function placeBid(
     return { success: false, reason: "Item is not currently up for auction" };
   if (item.sessionId !== participant.sessionId)
     return { success: false, reason: "Participant not in this session" };
+
+  // Even-teams cap: reject if this bidder is already at the maximum
+  if (item.session.enforceEvenTeams) {
+    const cap = await computeTeamCap(item.sessionId);
+    if (cap !== null) {
+      const wonCount = await prisma.item.count({
+        where: { sessionId: item.sessionId, winnerId: participantId, status: "SOLD" },
+      });
+      if (wonCount >= cap) {
+        return { success: false, reason: `Team is full (${cap} items)` };
+      }
+    }
+  }
 
   // Validate amount
   const minRequired = item.currentBid ? item.currentBid + 1 : item.minBid;
@@ -95,6 +130,12 @@ export async function placeBid(
         data: { amount, itemId, participantId },
       });
 
+      // Track that a bid happened this round (used for round-end auto-distribute logic)
+      await tx.session.update({
+        where: { id: item.sessionId },
+        data: { bidsThisRound: { increment: 1 } },
+      });
+
       return {
         success: true as const,
         participantName: freshParticipant.name,
@@ -111,6 +152,17 @@ export async function placeBid(
       CacheKeys.session(item.session.code)
     );
 
+    // Reset-time-on-bid: if remaining time is below the configured threshold,
+    // extend the timer so bidders have a chance to react.
+    let timerExtended: { endsAt: number; remainingMs: number } | undefined;
+    if (item.session.resetTime > 0) {
+      const minMs = item.session.resetTime * 1000;
+      const ext = await ensureMinRemaining(item.sessionId, minMs);
+      if (ext && ext.extended) {
+        timerExtended = { endsAt: ext.endsAt, remainingMs: minMs };
+      }
+    }
+
     logger.info(
       { itemId, participantId, amount, previousBid: item.currentBid ?? 0 },
       "Bid placed"
@@ -119,6 +171,7 @@ export async function placeBid(
     return {
       success: true,
       bid: { id: itemId, amount, participantName: result.participantName },
+      timerExtended,
     };
   } catch (err) {
     logger.error({ err, itemId, participantId }, "Bid failed");
@@ -194,35 +247,124 @@ export async function advanceToNextItem(sessionId: string): Promise<{
     order: number;
   } | null;
   completed: boolean;
+  autoDistributed?: boolean;
+  /** True when this call (or a recursive child) restarted a new round on UNSOLD items. */
+  roundRestarted?: boolean;
 }> {
   const session = await prisma.session.findUnique({
     where: { id: sessionId },
-    include: { items: { orderBy: { order: "asc" } } },
   });
 
   if (!session) return { item: null, completed: true };
 
-  const nextIdx = (session.currentItemIdx ?? -1) + 1;
-  const nextItem = session.items[nextIdx];
+  // Find next PENDING item (any round) by order
+  const nextItem = await prisma.item.findFirst({
+    where: { sessionId, status: "PENDING" },
+    orderBy: { order: "asc" },
+  });
 
   if (!nextItem) {
-    // All items done
-    await prisma.session.update({
-      where: { id: sessionId },
-      data: { status: "COMPLETED", currentItemIdx: nextIdx },
+    // No pending items left in this round. Check unsold to decide what to do.
+    const unsold = await prisma.item.findMany({
+      where: { sessionId, status: "UNSOLD" },
+      orderBy: { order: "asc" },
     });
-    await cacheInvalidate(
-      CacheKeys.activeItem(sessionId),
-      CacheKeys.session(session.code)
+
+    if (unsold.length === 0) {
+      // Everything sold — session complete
+      await prisma.session.update({
+        where: { id: sessionId },
+        data: { status: "COMPLETED" },
+      });
+      await cacheInvalidate(
+        CacheKeys.activeItem(sessionId),
+        CacheKeys.session(session.code)
+      );
+      return { item: null, completed: true };
+    }
+
+    // Re-read session to get current bidsThisRound
+    const fresh = await prisma.session.findUnique({ where: { id: sessionId } });
+    const bidsThisRound = fresh?.bidsThisRound ?? 0;
+
+    if (bidsThisRound === 0) {
+      // A whole round elapsed with zero bids — auto-distribute remaining items
+      await autoDistributeUnsoldItems(sessionId);
+      await prisma.session.update({
+        where: { id: sessionId },
+        data: { status: "COMPLETED" },
+      });
+      await cacheInvalidate(
+        CacheKeys.activeItem(sessionId),
+        CacheKeys.session(session.code)
+      );
+      logger.info(
+        { sessionId, distributed: unsold.length },
+        "Auto-distributed remaining items after silent round"
+      );
+      return { item: null, completed: true, autoDistributed: true };
+    }
+
+    // Start a new round: reset UNSOLD → PENDING, reset round bid counter
+    await prisma.$transaction([
+      prisma.item.updateMany({
+        where: { sessionId, status: "UNSOLD" },
+        data: { status: "PENDING" },
+      }),
+      prisma.session.update({
+        where: { id: sessionId },
+        data: { bidsThisRound: 0, currentItemIdx: null },
+      }),
+    ]);
+    await cacheInvalidate(CacheKeys.session(session.code));
+
+    logger.info(
+      { sessionId, unsoldCount: unsold.length },
+      "Starting new round with unsold items"
     );
-    return { item: null, completed: true };
+
+    // Recurse — now there are PENDING items again. Tag the result so
+    // callers (socket handlers) can emit a `round:restarted` event to
+    // clients so they don't silently see the same item reappear.
+    const recurseResult = await advanceToNextItem(sessionId);
+    return { ...recurseResult, roundRestarted: true };
+  }
+
+  // Even-teams short-circuit: if only one bidder is still under cap, no
+  // auction is necessary — auto-award to them and recurse.
+  if (session.enforceEvenTeams) {
+    const cap = await computeTeamCap(sessionId);
+    if (cap !== null) {
+      const bidders = await prisma.participant.findMany({
+        where: { sessionId, role: "BIDDER" },
+        include: { wonItems: { select: { id: true } } },
+        orderBy: { joinedAt: "asc" },
+      });
+      const eligible = bidders.filter((b) => b.wonItems.length < cap);
+      if (eligible.length === 1) {
+        const winner = eligible[0];
+        await prisma.item.update({
+          where: { id: nextItem.id },
+          data: { status: "SOLD", winnerId: winner.id, currentBid: 0 },
+        });
+        await cacheInvalidate(
+          CacheKeys.activeItem(sessionId),
+          CacheKeys.session(session.code)
+        );
+        logger.info(
+          { sessionId, itemId: nextItem.id, winnerId: winner.id },
+          "Auto-awarded item: only one eligible bidder remains"
+        );
+        return advanceToNextItem(sessionId);
+      }
+    }
   }
 
   // Activate next item
   await prisma.$transaction([
     prisma.session.update({
       where: { id: sessionId },
-      data: { currentItemIdx: nextIdx },
+      data: { currentItemIdx: nextItem.order },
     }),
     prisma.item.update({
       where: { id: nextItem.id },
@@ -259,4 +401,50 @@ export async function advanceToNextItem(sessionId: string): Promise<{
     },
     completed: false,
   };
+}
+
+/**
+ * Distribute all currently-UNSOLD items round-robin to bidders, giving each
+ * bidder as even a count as possible. Items are awarded for $0 (free) and
+ * the winning bidder's budget is NOT decremented. Used when an entire round
+ * elapses with zero bids and we need to forcibly resolve the session.
+ */
+async function autoDistributeUnsoldItems(sessionId: string) {
+  const unsold = await prisma.item.findMany({
+    where: { sessionId, status: "UNSOLD" },
+    orderBy: { order: "asc" },
+  });
+
+  if (unsold.length === 0) return;
+
+  const bidders = await prisma.participant.findMany({
+    where: { sessionId, role: "BIDDER" },
+    include: { wonItems: { select: { id: true } } },
+    orderBy: { joinedAt: "asc" },
+  });
+
+  if (bidders.length === 0) {
+    // No bidders to distribute to — leave as UNSOLD
+    return;
+  }
+
+  // Track running count per bidder so we always assign to the one with fewest
+  const counts = bidders.map((b) => ({
+    id: b.id,
+    count: b.wonItems.length,
+  }));
+
+  for (const item of unsold) {
+    counts.sort((a, b) => a.count - b.count);
+    const winner = counts[0];
+    await prisma.item.update({
+      where: { id: item.id },
+      data: {
+        status: "SOLD",
+        winnerId: winner.id,
+        currentBid: 0,
+      },
+    });
+    winner.count++;
+  }
 }

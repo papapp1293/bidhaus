@@ -2,6 +2,7 @@ import { z } from "zod/v4";
 import {
   DEFAULT_BUDGET,
   DEFAULT_TIME_PER_ITEM,
+  DEFAULT_RESET_TIME,
   MAX_ITEMS_PER_SESSION,
   MAX_BIDDERS_PER_SESSION,
 } from "./constants";
@@ -16,6 +17,8 @@ export const createSessionSchema = z.object({
     .min(5)
     .max(300)
     .default(DEFAULT_TIME_PER_ITEM),
+  resetTime: z.number().int().min(0).max(300).default(DEFAULT_RESET_TIME),
+  enforceEvenTeams: z.boolean().default(false),
 });
 
 export const addItemSchema = z.object({

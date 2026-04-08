@@ -57,8 +57,10 @@ for (const { name, worker } of workers) {
 async function start() {
   logger.info("BidHaus worker starting...");
 
-  // Ensure Redis is connected
-  if (redis.status !== "ready") {
+  // Wait for Redis to be ready
+  if (redis.status === "connecting") {
+    await new Promise<void>((resolve) => redis.once("ready", resolve));
+  } else if (redis.status !== "ready" && redis.status !== "connect") {
     await redis.connect();
   }
 

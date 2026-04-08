@@ -13,10 +13,13 @@ model Session {
   name            String
   hostName        String
   hostToken       String        @unique
-  budgetPerBidder Int           @default(100)
-  timePerItem     Int           @default(30)
-  status          SessionStatus @default(LOBBY)
-  currentItemIdx  Int?
+  budgetPerBidder  Int           @default(100)
+  timePerItem      Int           @default(30)
+  resetTime        Int           @default(0)
+  enforceEvenTeams Boolean       @default(false)
+  status           SessionStatus @default(LOBBY)
+  currentItemIdx   Int?
+  bidsThisRound    Int           @default(0)
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 

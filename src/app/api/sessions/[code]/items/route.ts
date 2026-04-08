@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/server/db";
 import { addItemSchema, addItemsBulkSchema } from "@/lib/validators";
 import { logger } from "@/lib/logger";
+import { cacheInvalidate, CacheKeys } from "@/server/cache";
 
 async function verifyHost(code: string, request: Request) {
   const token = request.headers.get("x-host-token");
@@ -80,6 +81,8 @@ export async function POST(
         })),
       });
 
+      await cacheInvalidate(CacheKeys.session(code));
+
       logger.info(
         { sessionCode: code, count: items.length },
         "Bulk items added"
@@ -112,6 +115,8 @@ export async function POST(
         order,
       },
     });
+
+    await cacheInvalidate(CacheKeys.session(code));
 
     logger.info({ sessionCode: code, item: item.name }, "Item added");
 
@@ -163,6 +168,8 @@ export async function PUT(
         })
       )
     );
+
+    await cacheInvalidate(CacheKeys.session(code));
 
     logger.info({ sessionCode: code }, "Items reordered");
 
@@ -221,6 +228,8 @@ export async function DELETE(
         })
       )
     );
+
+    await cacheInvalidate(CacheKeys.session(code));
 
     logger.info({ sessionCode: code, itemId }, "Item removed");
 
